@@ -2,6 +2,8 @@
 
 Parqueadero de ejemplo para la clase de **CI/CD con GitHub Actions y AWS** (Arquitectura de Software · CORHUILA).
 
+Práctica preparada por **Nicolas Quintero Garcia**.
+
 - Registrar entrada (placa + carro/moto), ver cupos libres, registrar salida y cobrar.
 - Tarifas: carro $3.000/h, moto $1.500/h, por hora o fracción (mínimo 1 h). Cupos: 20 carros, 10 motos.
 - Node 22 sin dependencias externas + SQLite integrado (`node:sqlite`).
