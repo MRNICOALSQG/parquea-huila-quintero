@@ -4,8 +4,7 @@
 #                       -> 3 despliega en la EC2 -> 4 comprueba que salió la versión nueva
 #
 # Para que corran los pasos 3 y 4 (Settings -> Secrets and variables -> Actions):
-#   Secrets:   EC2_HOST (IP pública de la EC2), EC2_SSH_KEY (contenido del .pem)
-#   Variables: DESPLEGAR_EC2 = si
+#   Variables: AWS_ROLE_TO_ASSUME (ARN del rol OIDC), DESPLEGAR_EC2 = si
 # Sin esa variable el pipeline llega hasta GHCR y no toca ningún servidor (cero costo en AWS).
 name: CI-CD
 
@@ -17,7 +16,6 @@ on:
 
 permissions:
   contents: read
-  packages: write        # para publicar en ghcr.io con el GITHUB_TOKEN
 
 env:
   REGISTRO: ghcr.io
@@ -37,6 +35,9 @@ jobs:
     name: 2 · Imagen + seguridad
     needs: pruebas        # si las pruebas fallan, este trabajo NO corre
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write    # solo este trabajo publica en GHCR
     outputs:
       imagen: ${{ steps.nombre.outputs.imagen }}
     steps:
@@ -74,33 +75,105 @@ jobs:
     needs: imagen
     if: github.event_name == 'push' && github.ref == 'refs/heads/main' && vars.DESPLEGAR_EC2 == 'si'
     runs-on: ubuntu-latest
+    permissions:
+      id-token: write     # OIDC solo está disponible en el trabajo de despliegue
     concurrency: produccion          # nunca dos despliegues al tiempo
+    outputs:
+      host: ${{ steps.destino.outputs.host }}
     steps:
-      - uses: actions/checkout@v5
+      - name: Obtener credenciales AWS temporales por OIDC
+        uses: aws-actions/configure-aws-credentials@v6.3.0
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_TO_ASSUME }}
+          aws-region: us-east-1
+          role-session-name: ParqueaHuila-${{ github.run_id }}-${{ github.run_attempt }}
+          mask-aws-account-id: true
 
-      - name: Preparar la llave SSH
-        run: |
-          install -m 700 -d ~/.ssh
-          echo "${{ secrets.EC2_SSH_KEY }}" | tr -d '\r' > ~/.ssh/ec2.pem
-          chmod 600 ~/.ssh/ec2.pem
-          ssh-keyscan -H "${{ secrets.EC2_HOST }}" >> ~/.ssh/known_hosts
-
-      - name: Copiar compose.prod.yml y actualizar
+      - name: Encontrar EC2 y enviar despliegue por SSM
+        id: destino
         env:
           IMAGEN: ${{ needs.imagen.outputs.imagen }}
           TAG: ${{ github.sha }}
         run: |
-          scp -i ~/.ssh/ec2.pem compose.prod.yml ec2-user@${{ secrets.EC2_HOST }}:app/compose.prod.yml
-          ssh -i ~/.ssh/ec2.pem ec2-user@${{ secrets.EC2_HOST }} bash -s <<EOF
-            set -e
-            cd app
-            printf 'IMAGEN=%s\nTAG=%s\n' "${IMAGEN}" "${TAG}" > .env
-            echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
-            docker compose -f compose.prod.yml pull
-            docker compose -f compose.prod.yml up -d --wait
-            docker logout ghcr.io
-            docker image prune -af --filter "until=24h"
-          EOF
+          set -euo pipefail
+
+          ACCOUNT=$(aws sts get-caller-identity --query Account --output text)
+          [[ "$ACCOUNT" == "869219776900" ]] || { echo "::error::Cuenta AWS inesperada: $ACCOUNT"; exit 1; }
+
+          mapfile -t INSTANCE_IDS < <(aws ec2 describe-instances \
+            --filters "Name=tag:Name,Values=ec2-parqueahuila" "Name=instance-state-name,Values=running" \
+            --query 'Reservations[].Instances[].InstanceId' --output text | tr '\t' '\n')
+          if [[ ${#INSTANCE_IDS[@]} -ne 1 || -z "${INSTANCE_IDS[0]}" ]]; then
+            echo "::error::Se esperaba una instancia running con Name=ec2-parqueahuila; se encontraron ${#INSTANCE_IDS[@]}"
+            exit 1
+          fi
+          INSTANCE_ID="${INSTANCE_IDS[0]}"
+
+          HOST=$(aws ec2 describe-instances --instance-ids "$INSTANCE_ID" \
+            --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
+          [[ -n "$HOST" && "$HOST" != "None" ]] || { echo "::error::La instancia no tiene IP pública"; exit 1; }
+          echo "host=$HOST" >> "$GITHUB_OUTPUT"
+          echo "instance_id=$INSTANCE_ID" >> "$GITHUB_OUTPUT"
+
+          # Estos valores son el nombre de imagen y el SHA del evento, no credenciales.
+          REMOTE_SCRIPT=$(cat <<'REMOTE'
+          set -euo pipefail
+          IMAGE='__IMAGE__'
+          TAG='__TAG__'
+          APP_DIR=/home/ec2-user/app
+          COMPOSE_URL="https://raw.githubusercontent.com/MRNICOALSQG/parquea-huila-quintero/${TAG}/compose.prod.yml"
+
+          install -d -o ec2-user -g ec2-user "$APP_DIR"
+          cd "$APP_DIR"
+          curl --fail --silent --show-error --location --retry 3 --retry-delay 2 "$COMPOSE_URL" -o compose.prod.yml
+          printf 'IMAGEN=%s\nTAG=%s\n' "$IMAGE" "$TAG" > .env
+          docker compose -f compose.prod.yml config --quiet
+          docker compose -f compose.prod.yml pull
+          docker compose -f compose.prod.yml up -d --wait --wait-timeout 120
+
+          CONTAINER_ID=$(docker compose -f compose.prod.yml ps -q app)
+          [[ -n "$CONTAINER_ID" ]]
+          [[ "$(docker inspect --format '{{.State.Running}}' "$CONTAINER_ID")" == "true" ]]
+          RESPONSE=$(curl --fail --silent --show-error --retry 12 --retry-delay 2 --retry-connrefused http://127.0.0.1/api/status)
+          printf '%s' "$RESPONSE" | grep -Fq '"status":"online"'
+          printf '%s' "$RESPONSE" | grep -Fq "\"version\":\"${TAG}\""
+          echo "Desplegado ${IMAGE}:${TAG}; contenedor activo y versión verificada."
+          REMOTE
+          )
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__IMAGE__/$IMAGEN}"
+          REMOTE_SCRIPT="${REMOTE_SCRIPT//__TAG__/$TAG}"
+          PARAMETERS=$(jq -n --arg commands "$REMOTE_SCRIPT" '{commands: [$commands]}')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --document-name AWS-RunShellScript \
+            --instance-ids "$INSTANCE_ID" \
+            --comment "ParqueaHuila deploy ${TAG}" \
+            --parameters "$PARAMETERS" \
+            --query 'Command.CommandId' --output text)
+          echo "SSM CommandId: $COMMAND_ID"
+
+          for attempt in $(seq 1 60); do
+            if INVOCATION=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" --output json 2>/dev/null); then
+              STATUS=$(jq -r '.Status // empty' <<< "$INVOCATION")
+              echo "SSM intento $attempt: ${STATUS:-sin estado}"
+              case "$STATUS" in
+                Success)
+                  jq -r '.StandardOutputContent // empty' <<< "$INVOCATION"
+                  exit 0
+                  ;;
+                Failed|TimedOut|Cancelled|Cancelling|Undeliverable|Terminated|DeliveryTimedOut|ExecutionTimedOut|InvalidPlatform|AccessDenied)
+                  jq -r '.StandardOutputContent // empty' <<< "$INVOCATION"
+                  jq -r '.StandardErrorContent // empty' <<< "$INVOCATION" >&2
+                  echo "::error::Comando SSM terminó en estado $STATUS"
+                  exit 1
+                  ;;
+              esac
+            fi
+            sleep 5
+          done
+          echo "::error::Timeout esperando la invocación SSM $COMMAND_ID"
+          exit 1
 
   verificar:
     name: 4 · Verificar en producción
@@ -108,12 +181,26 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: ¿Salió la versión nueva?
+        env:
+          HOST: ${{ needs.desplegar.outputs.host }}
         run: |
-          for i in $(seq 1 10); do
-            real=$(curl -fs http://${{ secrets.EC2_HOST }}/api/status | jq -r .version || true)
-            echo "intento $i: en producción=${real:-sin respuesta}  esperada=${GITHUB_SHA}"
-            [ "$real" = "$GITHUB_SHA" ] && exit 0
+          set -euo pipefail
+          [[ -n "$HOST" ]] || { echo "::error::La estación de despliegue no entregó una IP pública"; exit 1; }
+          URL="http://${HOST}/api/status"
+          for attempt in $(seq 1 20); do
+            response=$(curl --fail --silent --show-error --max-time 5 "$URL" 2>/dev/null || true)
+            if [[ -n "$response" ]]; then
+              version=$(jq -r '.version // empty' <<< "$response")
+              status=$(jq -r '.status // empty' <<< "$response")
+              echo "intento $attempt: status=${status:-desconocido} versión=${version:-sin respuesta} esperada=${GITHUB_SHA}"
+              if [[ "$status" == "online" && "$version" == "$GITHUB_SHA" ]]; then
+                echo "Aplicación pública verificada: $URL"
+                exit 0
+              fi
+            else
+              echo "intento $attempt: sin respuesta HTTP de $URL"
+            fi
             sleep 3
           done
-          echo "::error::Producción no muestra la versión ${GITHUB_SHA}"
+          echo "::error::Producción no devolvió HTTP válido con la versión ${GITHUB_SHA}"
           exit 1
